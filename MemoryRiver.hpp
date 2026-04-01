@@ -24,9 +24,11 @@ private:
     string file_name;
     int sizeofT = sizeof(T);
 
-    static constexpr int HEADER_BYTES = info_len * static_cast<int>(sizeof(int));
-    // Free list head is stored in header slot info_len (1-based)
-    static constexpr int FREE_HEAD_SLOT = info_len; // 1-based slot index
+    // We reserve info_len ints for user (1..info_len) and add 1 internal int
+    // at offset info_len (0-based) to store the free list head.
+    static constexpr int USER_HEADER_BYTES = info_len * static_cast<int>(sizeof(int));
+    static constexpr int INTERNAL_HEADER_BYTES = (info_len + 1) * static_cast<int>(sizeof(int));
+    static constexpr long long FREE_HEAD_OFFSET = USER_HEADER_BYTES; // byte offset for internal free head
 
     long long file_size()
     {
@@ -57,7 +59,8 @@ public:
         if (FN != "") file_name = FN;
         file.open(file_name, std::ios::out | std::ios::binary | std::ios::trunc);
         int tmp = 0;
-        for (int i = 0; i < info_len; ++i)
+        // Initialize user header (info_len) + 1 internal int (free list head)
+        for (int i = 0; i < info_len + 1; ++i)
             file.write(reinterpret_cast<char *>(&tmp), sizeof(int));
         file.close();
     }
@@ -94,26 +97,28 @@ public:
         }
 
         int free_head = 0;
-        long long free_head_off = static_cast<long long>((FREE_HEAD_SLOT - 1)) * sizeof(int);
-        read_int_at(free_head, free_head_off);
+        read_int_at(free_head, FREE_HEAD_OFFSET);
 
         int index = 0;
         if (free_head != 0) {
-            // Use block at free_head; read next pointer, then write object after that int
+            // Reuse block at free_head (points to block start). Layout: [int next][T bytes]
             int next_free = 0;
             read_int_at(next_free, free_head);
-            // Update free head in header
-            write_int_at(next_free, free_head_off);
-            // Object bytes start after the int next_free
+            // Update free head
+            write_int_at(next_free, FREE_HEAD_OFFSET);
+            // Write object at block_start + sizeof(int)
             index = free_head + static_cast<int>(sizeof(int));
             file.seekp(index, std::ios::beg);
             file.write(reinterpret_cast<char *>(&t), sizeof(T));
         } else {
-            // Append to end
+            // Append new block: [int reserved=0][T]
             long long sz = file_size();
-            if (sz < HEADER_BYTES) sz = HEADER_BYTES; // in case empty
-            index = static_cast<int>(sz);
+            if (sz < INTERNAL_HEADER_BYTES) sz = INTERNAL_HEADER_BYTES; // ensure header exists
+            // block start is sz
+            int reserved = 0;
             file.seekp(sz, std::ios::beg);
+            file.write(reinterpret_cast<char *>(&reserved), sizeof(int));
+            index = static_cast<int>(sz + sizeof(int));
             file.write(reinterpret_cast<char *>(&t), sizeof(T));
         }
 
@@ -145,30 +150,12 @@ public:
         if (!file) return;
         // Load current free head
         int free_head = 0;
-        long long free_head_off = static_cast<long long>((FREE_HEAD_SLOT - 1)) * sizeof(int);
-        read_int_at(free_head, free_head_off);
+        read_int_at(free_head, FREE_HEAD_OFFSET);
 
-        // Write next pointer at block start = index - sizeof(int)
+        // Compute block start and link into free list
         int block_start = index - static_cast<int>(sizeof(int));
-        if (block_start < HEADER_BYTES) {
-            // If index had no header for free list, allocate one in front by moving? Not feasible.
-            // Instead, create a free block exactly at index with an int next pointer in-place,
-            // but that would overlap with user bytes. To keep it consistent with our write(),
-            // we only support Delete on indices returned by write(), which ensures there is a
-            // preceding next pointer if from free list, or none if appended. For appended case,
-            // we will create a new free block by shifting object forward by sizeof(int).
-        }
-
-        // Robust approach: always place next pointer immediately before object bytes, growing file if needed
-        // Ensure space for the next pointer
-        if (index < HEADER_BYTES + sizeof(int)) {
-            // Should not happen with correct usage, but guard anyway
-        }
-
-        // Write next pointer at (index - sizeof(int))
-        write_int_at(free_head, static_cast<long long>(index) - sizeof(int));
-        // Update header free head to point to this block start
-        write_int_at(index - static_cast<int>(sizeof(int)), free_head_off);
+        write_int_at(free_head, static_cast<long long>(block_start));
+        write_int_at(block_start, FREE_HEAD_OFFSET);
 
         file.close();
     }
@@ -176,4 +163,3 @@ public:
 
 
 #endif //BPT_MEMORYRIVER_HPP
-
